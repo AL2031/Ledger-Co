@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Ledger &amp; Co. — Business Tycoon Simulator</title>
+<meta name="description" content="A browser-based business tycoon simulation. Build, price, staff, and finance your way to an empire.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Signature element: live market ticker -->
+  <div class="ticker-bar" aria-hidden="true">
+    <div class="ticker-track" id="tickerTrack"></div>
+  </div>
+
+  <div class="shell">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">L&amp;Co</span>
+        <span class="brand-name">Ledger &amp; Co.</span>
+      </div>
+
+      <nav class="nav" id="mainNav">
+        <button class="nav-item active" data-tab="overview">
+          <svg viewBox="0 0 24 24" class="nav-icon"><path d="M4 13h6V4H4v9Zm0 7h6v-5H4v5Zm10 0h6V11h-6v9Zm0-16v5h6V4h-6Z"/></svg>
+          <span>Overview</span>
+        </button>
+        <button class="nav-item" data-tab="operations">
+          <svg viewBox="0 0 24 24" class="nav-icon"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm8.94 3a7.97 7.97 0 0 0-.72-2.88l1.5-1.62-2-2-1.7 1.4a8 8 0 0 0-2.9-1.2L14.6 2h-3.2l-.52 2.7a8 8 0 0 0-2.9 1.2L6.28 4.5l-2 2 1.5 1.62A7.97 7.97 0 0 0 5.06 11H2v2h3.06c.14 1.02.4 1.98.78 2.88l-1.5 1.62 2 2 1.7-1.4a8 8 0 0 0 2.9 1.2L11.4 22h3.2l.52-2.7a8 8 0 0 0 2.9-1.2l1.7 1.4 2-2-1.5-1.62c.38-.9.64-1.86.78-2.88H22v-2h-3.06Z"/></svg>
+          <span>Operations</span>
+        </button>
+        <button class="nav-item" data-tab="finances">
+          <svg viewBox="0 0 24 24" class="nav-icon"><path d="M3 3v18h18v-2H5V3H3Zm4 14h2V9H7v8Zm4 0h2V5h-2v12Zm4 0h2v-6h-2v6Z"/></svg>
+          <span>Finances</span>
+        </button>
+        <button class="nav-item" data-tab="businesses">
+          <svg viewBox="0 0 24 24" class="nav-icon"><path d="M4 21V9l8-5 8 5v12h-6v-6H10v6H4Z"/></svg>
+          <span>Businesses</span>
+        </button>
+        <button class="nav-item" data-tab="market">
+          <svg viewBox="0 0 24 24" class="nav-icon"><path d="M3 17l6-6 4 4 8-8 1.4 1.4-9.4 9.4-4-4-4.6 4.6z"/></svg>
+          <span>Market &amp; News</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="rep-gauge">
+          <div class="rep-label"><span>Reputation</span><span id="repValue">50</span></div>
+          <div class="rep-bar"><div class="rep-bar-fill" id="repBarFill"></div></div>
+        </div>
+        <button class="btn btn-ghost btn-small" id="saveNowBtn">Save game</button>
+        <button class="btn btn-ghost btn-small btn-danger-text" id="resetGameBtn">Reset game</button>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-stat">
+          <span class="topbar-stat-label">Cash</span>
+          <span class="topbar-stat-value mono" id="statCash">$0</span>
+        </div>
+        <div class="topbar-stat">
+          <span class="topbar-stat-label">Net worth</span>
+          <span class="topbar-stat-value mono" id="statNetWorth">$0</span>
+        </div>
+        <div class="topbar-stat">
+          <span class="topbar-stat-label">Today's profit</span>
+          <span class="topbar-stat-value mono" id="statTodayProfit">$0</span>
+        </div>
+        <div class="topbar-date">
+          <span id="statDate">Year 1, Day 1</span>
+        </div>
+
+        <div class="time-controls">
+          <button class="time-btn" id="playPauseBtn" title="Play / Pause">
+            <svg viewBox="0 0 24 24" class="icon-play"><path d="M8 5v14l11-7z"/></svg>
+            <svg viewBox="0 0 24 24" class="icon-pause" style="display:none"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>
+          </button>
+          <div class="speed-toggle" id="speedToggle">
+            <button class="speed-btn active" data-speed="1">1x</button>
+            <button class="speed-btn" data-speed="2">2x</button>
+            <button class="speed-btn" data-speed="5">5x</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="content" id="content">
+
+        <section class="tab active" id="tab-overview"></section>
+        <section class="tab" id="tab-operations"></section>
+        <section class="tab" id="tab-finances"></section>
+        <section class="tab" id="tab-businesses"></section>
+        <section class="tab" id="tab-market"></section>
+
+      </main>
+    </div>
+
+    <!-- Event log -->
+    <aside class="eventlog-panel">
+      <div class="eventlog-header">
+        <span>Event Log</span>
+        <span class="eventlog-day" id="eventLogDay">Day 1</span>
+      </div>
+      <div class="eventlog-list" id="eventLogList"></div>
+    </aside>
+
+  </div>
+
+  <!-- Mobile bottom nav -->
+  <nav class="mobile-nav" id="mobileNav">
+    <button class="mnav-item active" data-tab="overview">Overview</button>
+    <button class="mnav-item" data-tab="operations">Ops</button>
+    <button class="mnav-item" data-tab="finances">Finance</button>
+    <button class="mnav-item" data-tab="businesses">Biz</button>
+    <button class="mnav-item" data-tab="market">Market</button>
+  </nav>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal" id="modalRoot" role="dialog" aria-modal="true"></div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
