@@ -125,12 +125,12 @@ const BUSINESS_TYPES = {
   },
   manufacturing: {
     id: 'manufacturing', name: 'Manufacturing', icon: '🏭', kind: 'manufacturing', sector: 'industrial',
-    startupCost: 60000, rent: 250, baseUtilities: 80,
-    baseMaterialCost: 14, baseDemand: 28, startingMaterialStock: 400,
+    startupCost: 60000, rent: 150, baseUtilities: 50,
+    baseMaterialCost: 14, baseDemand: 40,
     baseCapacityPerLevel: 260, upgradeCost: [0, 40000, 80000, 150000, 250000],
     productivityPerEmployee: 35, marketingSensitivity: 0.7, baseProductSlots: 2,
     employeeSlots: 12, wagePerEmployee: 95, idealEmployees: 4, elasticity: 1.3,
-    description: 'Buy raw materials, convert them into finished goods on the line, then sell in bulk. Running out of stock halts production across every product line — keep an eye on your inventory.',
+    description: 'Raw materials are sourced automatically at the day\u2019s market rate as you produce — no restocking to manage. Hire enough line staff to keep up with demand and sell in bulk.',
     productCatalog: [
       { id: 'brackets', name: 'Steel Brackets', basePrice: 38, demandShare: 1.2, unlockCost: 0 },
       { id: 'containers', name: 'Injection-Molded Containers', basePrice: 45, demandShare: 1.0, unlockCost: 15000 },
@@ -279,7 +279,6 @@ function createBusiness(typeId, name) {
     employees: [],
     reputation: 50,
     activeMarketing: null,       // { tierId, demandMultiplier, daysLeft }
-    materialStock: cfg.startingMaterialStock || 0, // manufacturing only: raw material units on hand
     subscriberBase: 0,           // saas only
     properties: [],              // realestate only
     products: (cfg.productCatalog || []).map((c, i) => createProductInstance(c, i === 0, day)),
@@ -576,28 +575,30 @@ function tickManufacturingBusiness(biz, cfg) {
   const expenses = wages + rent + utilities;
 
   if (alloc.weighted.length === 0) {
-    return { revenue: 0, cogs: 0, expenses, waste: 0, profit: -expenses, unitsSold: 0, shortfall: 0 };
+    return { revenue: 0, cogs: 0, expenses, waste: 0, profit: -expenses, unitsSold: 0 };
   }
 
   const potentialDemand = cfg.baseDemand * alloc.avgElasticity * marketingFactor * employeeFactor * reputationFactor * noise;
-  const desiredProduction = Math.min(potentialDemand, demandCapacity, productionCapacity);
-  // Materials are paid for up-front at restock time (see restockMaterials);
-  // the shared stock pool caps total production across every product line.
-  const actualProduction = Math.max(0, Math.min(desiredProduction, biz.materialStock));
-  biz.materialStock -= actualProduction;
+  // Production is limited by demand and by how many hands are on the line —
+  // NOT by a stockpile. Raw materials are bought automatically, just-in-time,
+  // at today's fluctuating market rate (still visible on the ticker), so
+  // there's no restocking to manage and no surprise stockouts.
+  const production = Math.max(0, Math.min(potentialDemand, demandCapacity, productionCapacity));
+  const unitCost = cfg.baseMaterialCost * sectorIdx.costFactor;
+  const materialCost = production * unitCost;
 
   let revenue = 0;
   alloc.weighted.forEach(w => {
     const share = alloc.totalWeight > 0 ? w.weight / alloc.totalWeight : 1 / alloc.weighted.length;
-    const unitsSold = actualProduction * share;
+    const unitsSold = production * share;
     const productRevenue = unitsSold * w.p.price;
+    const productCogs = unitsSold * unitCost;
     revenue += productRevenue;
-    recordProductDay(w.p, unitsSold, productRevenue, 0);
+    recordProductDay(w.p, unitsSold, productRevenue, productCogs);
   });
 
-  const profit = revenue - expenses;
-  const shortfall = Math.max(0, desiredProduction - actualProduction);
-  return { revenue, cogs: 0, expenses, waste: 0, profit, unitsSold: actualProduction, shortfall };
+  const profit = revenue - materialCost - expenses;
+  return { revenue, cogs: materialCost, expenses, waste: 0, profit, unitsSold: production, staffLimited: productionCapacity < demandCapacity && productionCapacity < potentialDemand };
 }
 
 function tickSubscriptionBusiness(biz, cfg) {
@@ -1050,18 +1051,6 @@ function buyOutProperty(bizId) {
   renderOperations();
 }
 
-function restockMaterials(bizId, units) {
-  const biz = state.businesses.find(b => b.id === bizId);
-  const cfg = BUSINESS_TYPES[biz.typeId];
-  const sectorIdx = state.marketIndex[cfg.sector];
-  const unitCost = cfg.baseMaterialCost * sectorIdx.costFactor;
-  const totalCost = units * unitCost;
-  if (state.cash < totalCost) { showToast(`Need ${formatMoney(totalCost)} for that much stock`); return; }
-  state.cash -= totalCost;
-  biz.materialStock += units;
-  logEvent(`Restocked ${formatNum(units)} units of raw material at ${biz.name} for ${formatMoney(totalCost)}.`, 'info');
-  renderOperations();
-}
 
 // --- real estate specific -----------------------------------------
 
@@ -1164,19 +1153,14 @@ function payOffLoan(loanId) {
 // Any outstanding bank loans are tied to the player, not the business,
 // so they are NOT forgiven by closing it.
 const LIQUIDATION_PROPERTY_RATE = 0.6;   // owned property/leasehold improvements
-const LIQUIDATION_MATERIAL_RATE = 0.5;   // unused manufacturing raw material
 const CLOSE_BUSINESS_REPUTATION_HIT = 4;
 
 function estimateLiquidationValue(biz, cfg) {
   let value = 0;
   if (cfg.kind === 'property') {
     value += biz.properties.reduce((s, p) => s + p.currentValue, 0);
-  } else {
-    if (biz.propertyOwned) value += getOwnedPropertyValue(biz, cfg) * LIQUIDATION_PROPERTY_RATE;
-    if (cfg.kind === 'manufacturing') {
-      const sectorIdx = state.marketIndex[cfg.sector];
-      value += biz.materialStock * cfg.baseMaterialCost * sectorIdx.costFactor * LIQUIDATION_MATERIAL_RATE;
-    }
+  } else if (biz.propertyOwned) {
+    value += getOwnedPropertyValue(biz, cfg) * LIQUIDATION_PROPERTY_RATE;
   }
   return Math.round(value);
 }
@@ -1216,7 +1200,6 @@ function computeNetWorth() {
   state.businesses.forEach(biz => {
     const cfg = BUSINESS_TYPES[biz.typeId];
     value += getOwnedPropertyValue(biz, cfg);
-    if (cfg.kind === 'manufacturing') value += biz.materialStock * cfg.baseMaterialCost;
   });
   state.loans.forEach(l => { value -= l.balance; });
   return value;
@@ -1414,17 +1397,13 @@ function manufacturingOperationsHtml(biz, cfg) {
   const nextUpgradeCost = (cfg.upgradeCost || [])[biz.propertyLevel];
   const sectorIdx = state.marketIndex[cfg.sector];
   const unitCost = (cfg.baseMaterialCost * sectorIdx.costFactor).toFixed(2);
-  const restockAmount = Math.max(50, Math.round(capacity));
-  const restockCost = Math.round(restockAmount * unitCost);
+  const productionCapacity = biz.employees.length * cfg.productivityPerEmployee;
 
   let warning = '';
-  if (biz.materialStock <= 0) {
-    warning = `<div class="alert-banner">⚠️ Out of raw material — the line is producing nothing, but rent, utilities, and wages are still charged every day. Restock below.</div>`;
-  } else if (biz.materialStock < restockAmount * 0.15) {
-    warning = `<div class="alert-banner warn">Raw material is running low — restock soon or production will stall.</div>`;
-  }
   if (biz.employees.length === 0) {
-    warning += `<div class="alert-banner">⚠️ No one is staffing the line — hire at least one employee or production stays at zero regardless of stock.</div>`;
+    warning = `<div class="alert-banner">⚠️ No one is staffing the line — hire at least one employee or production stays at zero.</div>`;
+  } else if (biz.lastDaily.staffLimited) {
+    warning = `<div class="alert-banner warn">Staff throughput is your bottleneck — hire more line workers to capture the demand you're leaving on the table.</div>`;
   }
 
   return `
@@ -1432,17 +1411,15 @@ function manufacturingOperationsHtml(biz, cfg) {
       <div class="panel-header"><h3>Production line</h3></div>
       ${warning}
       <div class="field">
-        <label>Line capacity — level ${biz.propertyLevel} (${formatNum(capacity)} units/day, shared across every product, needs staff to match)</label>
-        <div class="hint">Produced &amp; sold yesterday: ${formatNum(biz.lastDaily.unitsSold, 1)} units${biz.lastDaily.shortfall > 0 ? ` · lost ${formatNum(biz.lastDaily.shortfall, 1)} units to insufficient stock` : ''}</div>
+        <label>Demand ceiling — level ${biz.propertyLevel} (${formatNum(capacity)} units/day, shared across every product)</label>
+        <div class="hint">Produced &amp; sold yesterday: ${formatNum(biz.lastDaily.unitsSold, 1)} units</div>
         <button class="btn btn-small" style="margin-top:8px;" data-action="upgrade-property" data-biz="${biz.id}" ${nextUpgradeCost == null ? 'disabled' : ''}>
           ${nextUpgradeCost != null ? `Upgrade — ${formatMoney(nextUpgradeCost)}` : 'Max level'}
         </button>
       </div>
       <div class="field">
-        <label>Raw material stock: ${formatNum(biz.materialStock, 1)} units (current cost ~$${unitCost}/unit, shared by all product lines)</label>
-        <button class="btn btn-small btn-primary" data-action="restock" data-biz="${biz.id}" data-units="${restockAmount}">
-          Restock ${formatNum(restockAmount)} units — ${formatMoney(restockCost)}
-        </button>
+        <label>Staff throughput: ${formatNum(productionCapacity)} units/day (${biz.employees.length} employee${biz.employees.length === 1 ? '' : 's'} × ${cfg.productivityPerEmployee}/day each)</label>
+        <div class="hint">Raw materials are bought automatically as you produce, at today's market rate — currently ~$${unitCost}/unit. No restocking to manage.</div>
       </div>
     </div>`;
 }
@@ -1534,9 +1511,8 @@ function openProductAnalyticsModal(bizId, catalogId) {
   const cfg = BUSINESS_TYPES[biz.typeId];
   const catalogEntry = cfg.productCatalog.find(c => c.id === catalogId);
   const p = biz.products.find(x => x.catalogId === catalogId);
-  const isManufacturing = cfg.kind === 'manufacturing';
 
-  const chart = buildSparklineSvg(p.history, isManufacturing ? 'revenue' : 'margin', isManufacturing ? 'var(--info)' : 'var(--profit)');
+  const chart = buildSparklineSvg(p.history, 'margin', 'var(--profit)');
   const daysActive = p.addedOnDay ? Math.max(1, state.day - p.addedOnDay) : 0;
   const avgDailyUnits = daysActive > 0 ? p.lifetime.unitsSold / daysActive : 0;
 
@@ -1547,10 +1523,10 @@ function openProductAnalyticsModal(bizId, catalogId) {
     ${chart}
     <div class="wb-row"><span>Yesterday's units sold</span><span class="mono">${formatNum(p.lastDaily.unitsSold, 1)}</span></div>
     <div class="wb-row"><span>Yesterday's revenue</span><span class="mono">${formatMoney(p.lastDaily.revenue)}</span></div>
-    ${!isManufacturing ? `<div class="wb-row"><span>Yesterday's margin</span><span class="mono">${formatSignedMoney(p.lastDaily.margin)}</span></div>` : ''}
+    <div class="wb-row"><span>Yesterday's margin</span><span class="mono">${formatSignedMoney(p.lastDaily.margin)}</span></div>
     <div class="wb-row"><span>Avg. units/day (lifetime)</span><span class="mono">${formatNum(avgDailyUnits, 1)}</span></div>
     <div class="wb-row"><span>Lifetime revenue</span><span class="mono">${formatMoney(p.lifetime.revenue)}</span></div>
-    <div class="wb-row"><span>${isManufacturing ? 'Lifetime units produced' : 'Lifetime margin'}</span><span class="mono">${isManufacturing ? formatNum(p.lifetime.unitsSold, 0) : formatSignedMoney(p.lifetime.margin)}</span></div>
+    <div class="wb-row"><span>Lifetime margin</span><span class="mono">${formatSignedMoney(p.lifetime.margin)}</span></div>
     <div class="modal-footer"><button class="btn btn-ghost" data-action="close-modal">Close</button></div>
   `);
 }
@@ -1959,7 +1935,6 @@ function wireEvents() {
       case 'buy-marketing': buyMarketing(bizId, +target.dataset.tier); break;
       case 'upgrade-property': upgradeProperty(bizId); break;
       case 'buyout-property': buyOutProperty(bizId); break;
-      case 'restock': restockMaterials(bizId, +target.dataset.units); break;
       case 'buy-realestate': buyRealEstateProperty(bizId); break;
       case 'upgrade-realestate': upgradeRealEstateProperty(bizId, target.dataset.prop); break;
       case 'sell-realestate': sellRealEstateProperty(bizId, target.dataset.prop); break;
