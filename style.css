@@ -311,6 +311,13 @@ select{ font-family:var(--font-body); }
 .empty-state h3{ color:var(--text); margin-bottom:8px; font-size:16px; }
 .empty-state p{ font-size:13px; max-width:340px; margin:0 auto; }
 
+.alert-banner{
+  background:var(--loss-soft); border:1px solid var(--loss); color:var(--text);
+  padding:10px 12px; border-radius:var(--radius-sm); font-size:12.5px;
+  margin-bottom:12px; line-height:1.5;
+}
+.alert-banner.warn{ background:var(--accent-soft); border-color:var(--accent); }
+
 /* Overview: business switch cards */
 .biz-card{
   background:var(--surface); border:1px solid var(--border-soft); border-radius:var(--radius);
