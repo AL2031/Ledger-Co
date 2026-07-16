@@ -125,12 +125,12 @@ const BUSINESS_TYPES = {
   },
   manufacturing: {
     id: 'manufacturing', name: 'Manufacturing', icon: '🏭', kind: 'manufacturing', sector: 'industrial',
-    startupCost: 60000, rent: 400, baseUtilities: 120,
-    baseMaterialCost: 14, baseDemand: 28,
+    startupCost: 60000, rent: 250, baseUtilities: 80,
+    baseMaterialCost: 14, baseDemand: 28, startingMaterialStock: 400,
     baseCapacityPerLevel: 260, upgradeCost: [0, 40000, 80000, 150000, 250000],
     productivityPerEmployee: 35, marketingSensitivity: 0.7, baseProductSlots: 2,
-    employeeSlots: 12, wagePerEmployee: 95, idealEmployees: 6, elasticity: 1.3,
-    description: 'Buy raw materials, convert them into finished goods on the line, then sell in bulk. Running out of stock halts production across every product line.',
+    employeeSlots: 12, wagePerEmployee: 95, idealEmployees: 4, elasticity: 1.3,
+    description: 'Buy raw materials, convert them into finished goods on the line, then sell in bulk. Running out of stock halts production across every product line — keep an eye on your inventory.',
     productCatalog: [
       { id: 'brackets', name: 'Steel Brackets', basePrice: 38, demandShare: 1.2, unlockCost: 0 },
       { id: 'containers', name: 'Injection-Molded Containers', basePrice: 45, demandShare: 1.0, unlockCost: 15000 },
@@ -279,7 +279,7 @@ function createBusiness(typeId, name) {
     employees: [],
     reputation: 50,
     activeMarketing: null,       // { tierId, demandMultiplier, daysLeft }
-    materialStock: 0,            // manufacturing only: raw material units on hand
+    materialStock: cfg.startingMaterialStock || 0, // manufacturing only: raw material units on hand
     subscriberBase: 0,           // saas only
     properties: [],              // realestate only
     products: (cfg.productCatalog || []).map((c, i) => createProductInstance(c, i === 0, day)),
@@ -1154,6 +1154,55 @@ function payOffLoan(loanId) {
   renderAll();
 }
 
+// --- closing / bankrupting a business --------------------------------
+//
+// There was previously no way out of a business that's underwater —
+// rent, wages, and marketing keep billing forever even if you've given
+// up on it. This liquidates whatever's recoverable (owned property,
+// a real-estate portfolio, unused manufacturing stock — all at a
+// discount, since it's a fire sale) and removes the business for good.
+// Any outstanding bank loans are tied to the player, not the business,
+// so they are NOT forgiven by closing it.
+const LIQUIDATION_PROPERTY_RATE = 0.6;   // owned property/leasehold improvements
+const LIQUIDATION_MATERIAL_RATE = 0.5;   // unused manufacturing raw material
+const CLOSE_BUSINESS_REPUTATION_HIT = 4;
+
+function estimateLiquidationValue(biz, cfg) {
+  let value = 0;
+  if (cfg.kind === 'property') {
+    value += biz.properties.reduce((s, p) => s + p.currentValue, 0);
+  } else {
+    if (biz.propertyOwned) value += getOwnedPropertyValue(biz, cfg) * LIQUIDATION_PROPERTY_RATE;
+    if (cfg.kind === 'manufacturing') {
+      const sectorIdx = state.marketIndex[cfg.sector];
+      value += biz.materialStock * cfg.baseMaterialCost * sectorIdx.costFactor * LIQUIDATION_MATERIAL_RATE;
+    }
+  }
+  return Math.round(value);
+}
+
+function closeBusiness(bizId) {
+  const biz = state.businesses.find(b => b.id === bizId);
+  if (!biz) return;
+  const cfg = BUSINESS_TYPES[biz.typeId];
+  const liquidation = estimateLiquidationValue(biz, cfg);
+
+  state.cash += liquidation;
+  state.reputation = clamp(state.reputation - CLOSE_BUSINESS_REPUTATION_HIT, 0, 100);
+  state.businesses = state.businesses.filter(b => b.id !== bizId);
+  if (state.activeBusinessId === bizId) {
+    state.activeBusinessId = state.businesses.length ? state.businesses[0].id : null;
+  }
+
+  logEvent(
+    `Closed ${biz.name}${liquidation > 0 ? ` — recovered ${formatMoney(liquidation)} liquidating assets.` : ' — nothing left to recover.'}`,
+    'warn'
+  );
+  showToast(`${biz.name} closed`);
+  closeModal();
+  renderAll();
+}
+
 /* =============================================================
    8. RENDER
    ============================================================= */
@@ -1367,9 +1416,21 @@ function manufacturingOperationsHtml(biz, cfg) {
   const unitCost = (cfg.baseMaterialCost * sectorIdx.costFactor).toFixed(2);
   const restockAmount = Math.max(50, Math.round(capacity));
   const restockCost = Math.round(restockAmount * unitCost);
+
+  let warning = '';
+  if (biz.materialStock <= 0) {
+    warning = `<div class="alert-banner">⚠️ Out of raw material — the line is producing nothing, but rent, utilities, and wages are still charged every day. Restock below.</div>`;
+  } else if (biz.materialStock < restockAmount * 0.15) {
+    warning = `<div class="alert-banner warn">Raw material is running low — restock soon or production will stall.</div>`;
+  }
+  if (biz.employees.length === 0) {
+    warning += `<div class="alert-banner">⚠️ No one is staffing the line — hire at least one employee or production stays at zero regardless of stock.</div>`;
+  }
+
   return `
     <div class="card">
       <div class="panel-header"><h3>Production line</h3></div>
+      ${warning}
       <div class="field">
         <label>Line capacity — level ${biz.propertyLevel} (${formatNum(capacity)} units/day, shared across every product, needs staff to match)</label>
         <div class="hint">Produced &amp; sold yesterday: ${formatNum(biz.lastDaily.unitsSold, 1)} units${biz.lastDaily.shortfall > 0 ? ` · lost ${formatNum(biz.lastDaily.shortfall, 1)} units to insufficient stock` : ''}</div>
@@ -1434,6 +1495,7 @@ function productsPanelHtml(biz, cfg) {
   return `
     <div class="card">
       <div class="panel-header"><h3>Products (${activeCount}/${slots} active)</h3></div>
+      ${activeCount === 0 ? `<div class="alert-banner">⚠️ Nothing is active — you're paying full overhead with zero revenue coming in. Add or resume a product below.</div>` : ''}
       <table>
         <thead><tr><th>Product</th><th>Price</th><th>Yesterday</th><th>Actions</th></tr></thead>
         <tbody>${rows}</tbody>
@@ -1583,6 +1645,7 @@ function renderOperations() {
       <span style="font-size:26px;">${cfg.icon}</span>
       <input type="text" value="${escapeHtml(biz.name)}" data-action="rename-biz" data-biz="${biz.id}" style="font-family:var(--font-display); font-weight:600; font-size:15px; background:transparent; border:1px solid transparent; padding:6px 8px; max-width:260px;">
       <span class="badge ${biz.lastDaily.profit >= 0 ? 'badge-profit' : 'badge-loss'}" style="margin-left:auto;">Yesterday ${formatSignedMoney(biz.lastDaily.profit)}</span>
+      <button class="btn btn-small btn-ghost btn-danger-text" data-action="open-close-business-modal" data-biz="${biz.id}">Close business</button>
     </div>
     ${cfg.productCatalog ? productsPanelHtml(biz, cfg) : ''}
     <div class="grid grid-2" style="margin-top:14px; align-items:start;">
@@ -1824,6 +1887,27 @@ function openOnboardingModal() {
   `);
 }
 
+function openCloseBusinessModal(bizId) {
+  const biz = state.businesses.find(b => b.id === bizId);
+  const cfg = BUSINESS_TYPES[biz.typeId];
+  const liquidation = estimateLiquidationValue(biz, cfg);
+  const isLosingMoney = biz.lastDaily.profit < 0;
+
+  openModal(`
+    <button class="modal-close" data-action="close-modal">&times;</button>
+    <h3>Close ${escapeHtml(biz.name)}?</h3>
+    <p class="modal-sub">This shuts the business down for good — employees are let go, any product lineup is lost, and the slot frees up for something new. Any bank loans stay with you; they're not tied to this business.</p>
+    <div class="wb-row"><span>Estimated liquidation proceeds</span><span class="mono">${formatMoney(liquidation)}</span></div>
+    <div class="wb-row"><span>Reputation impact</span><span class="mono" style="color:var(--loss);">-${CLOSE_BUSINESS_REPUTATION_HIT}</span></div>
+    ${isLosingMoney ? `<p class="hint" style="margin-top:8px;">This business lost ${formatMoney(Math.abs(biz.lastDaily.profit))} yesterday — closing it stops the bleeding immediately.</p>` : ''}
+    <p class="hint" style="margin-top:8px;">This can't be undone.</p>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" data-action="close-modal">Cancel</button>
+      <button class="btn btn-danger" data-action="confirm-close-business" data-biz="${biz.id}">Close business</button>
+    </div>
+  `);
+}
+
 /* =============================================================
    9. EVENTS
    ============================================================= */
@@ -1881,6 +1965,8 @@ function wireEvents() {
       case 'sell-realestate': sellRealEstateProperty(bizId, target.dataset.prop); break;
       case 'toggle-product': toggleProduct(bizId, target.dataset.product); break;
       case 'view-product-analytics': openProductAnalyticsModal(bizId, target.dataset.product); break;
+      case 'open-close-business-modal': openCloseBusinessModal(bizId); break;
+      case 'confirm-close-business': closeBusiness(bizId); break;
       case 'open-loan-modal': openLoanModal(); break;
       case 'confirm-loan': takeLoan(qs('#loanProduct').value, +qs('#loanAmount').value || 0); break;
       case 'payoff-loan': payOffLoan(target.dataset.loan); break;
