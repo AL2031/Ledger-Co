@@ -53,8 +53,9 @@ const LOAN_PRODUCTS = [
   { id: 'standard', name: 'Standard', termDays: 90, apr: 0.10 },
   { id: 'long', name: 'Long-Term', termDays: 180, apr: 0.07 }
 ];
-const LOAN_MAX_MULTIPLE_OF_CASH = 4; // max principal ~= 4x current cash
+const LOAN_MAX_MULTIPLE_OF_CASH = 4; // max principal ~= 4x current cash, further scaled by reputation
 const LOAN_MISSED_PENALTY = 250;
+const LOAN_PAID_OFF_REPUTATION_BONUS = 3;
 
 // Marketing campaign tiers. demandMultiplier is the raw multiplier
 // on daily demand while active; each business type's
@@ -279,6 +280,7 @@ function createBusiness(typeId, name) {
     employees: [],
     reputation: 50,
     activeMarketing: null,       // { tierId, demandMultiplier, daysLeft }
+    autoMarketingTierId: null,   // if set, relaunches this tier automatically whenever a campaign lapses — even offline
     subscriberBase: 0,           // saas only
     properties: [],              // realestate only
     products: (cfg.productCatalog || []).map((c, i) => createProductInstance(c, i === 0, day)),
@@ -372,6 +374,22 @@ function resetGame() {
 const OFFLINE_EFFICIENCY = 0.6;
 const OFFLINE_MAX_DAYS = 60;
 
+// Counts how many times an auto-renewed campaign would have relaunched
+// over `offlineDays`, respecting whatever days were already left on it
+// when the game was closed (so a 2-day absence with 8 days left on a
+// campaign doesn't get charged for a whole new cycle it didn't need).
+function countAutoRenewCycles(activeMarketing, tier, offlineDays) {
+  let remaining = activeMarketing ? activeMarketing.daysLeft : 0;
+  let simulated = 0, cycles = 0;
+  while (simulated < offlineDays) {
+    if (remaining <= 0) { cycles++; remaining = tier.durationDays; }
+    const step = Math.min(remaining, offlineDays - simulated);
+    remaining -= step;
+    simulated += step;
+  }
+  return cycles;
+}
+
 function applyOfflineEarnings() {
   const elapsedMs = Date.now() - (state.lastSaveRealTime || Date.now());
   let offlineDays = Math.floor(elapsedMs / BASE_DAY_MS);
@@ -386,8 +404,26 @@ function applyOfflineEarnings() {
     const dailyRevenue = (biz.lastDaily.revenue || 0) * OFFLINE_EFFICIENCY;
     const dailyExpenses = (biz.lastDaily.expenses || 0) + (biz.lastDaily.cogs || 0);
     const bizRevenue = dailyRevenue * offlineDays;
-    const bizExpenses = dailyExpenses * OFFLINE_EFFICIENCY * offlineDays;
-    const bizProfit = dailyProfit * offlineDays;
+    let bizExpenses = dailyExpenses * OFFLINE_EFFICIENCY * offlineDays;
+    let bizProfit = dailyProfit * offlineDays;
+
+    // Auto-renewed marketing keeps billing while you're away too — this is
+    // what makes "auto-advertise" genuinely work offline, not just pause
+    // the moment the tab closes.
+    if (biz.autoMarketingTierId) {
+      const tier = MARKETING_TIERS.find(t => t.id === biz.autoMarketingTierId);
+      if (tier) {
+        const cycles = countAutoRenewCycles(biz.activeMarketing, tier, offlineDays);
+        if (cycles > 0) {
+          const adSpend = cycles * tier.cost;
+          bizExpenses += adSpend;
+          bizProfit -= adSpend;
+        }
+        // Leave it freshly active so the player comes back to a running campaign.
+        biz.activeMarketing = { tierId: tier.id, demandMultiplier: tier.demandMultiplier, daysLeft: tier.durationDays };
+      }
+    }
+
     totalRevenue += bizRevenue;
     totalExpenses += bizExpenses;
     totalProfit += bizProfit;
@@ -650,6 +686,19 @@ function tickPropertyBusiness(biz, cfg) {
   return { revenue: rentIncome, cogs: 0, expenses, waste: 0, profit, unitsSold: biz.properties.length };
 }
 
+// If the player has picked a tier to auto-renew, relaunch it the moment
+// the current campaign lapses — no manual clicking needed, and (via
+// applyOfflineEarnings) it keeps running even while the tab is closed.
+// Silently skips a cycle if cash is short; it'll try again next time.
+function maybeAutoRenewMarketing(biz) {
+  if (!biz.autoMarketingTierId || biz.activeMarketing) return;
+  const tier = MARKETING_TIERS.find(t => t.id === biz.autoMarketingTierId);
+  if (!tier || state.cash < tier.cost) return;
+  state.cash -= tier.cost;
+  biz.activeMarketing = { tierId: tier.id, demandMultiplier: tier.demandMultiplier, daysLeft: tier.durationDays };
+  logEvent(`Auto-renewed "${tier.name}" at ${biz.name} for ${formatMoney(tier.cost)}.`, 'info');
+}
+
 function tickBusiness(biz) {
   const cfg = BUSINESS_TYPES[biz.typeId];
   let result;
@@ -680,9 +729,21 @@ function tickBusiness(biz) {
     biz.activeMarketing.daysLeft -= 1;
     if (biz.activeMarketing.daysLeft <= 0) biz.activeMarketing = null;
   }
+  maybeAutoRenewMarketing(biz);
 
   state.cash += result.profit;
   return result;
+}
+
+// The sidebar's global reputation is separate from each business's own
+// reputation (which drives its demand — see computeReputationFactor).
+// Global reputation trails the average of your businesses' reputations,
+// so running profitable businesses is the main way to build it up over
+// time; loan behavior (missed payments, payoffs) nudges it directly.
+function driftGlobalReputation() {
+  if (state.businesses.length === 0) return;
+  const avgBizReputation = state.businesses.reduce((s, b) => s + b.reputation, 0) / state.businesses.length;
+  state.reputation = clamp(state.reputation + (avgBizReputation - state.reputation) * 0.05, 0, 100);
 }
 
 // --- market index drift & events ---------------------------------
@@ -761,7 +822,8 @@ function processLoansDaily() {
       if (loan.balance > 0.5) {
         logEvent(`Your ${loan.productName} loan term ended with ${formatMoney(loan.balance)} still outstanding.`, 'warn');
       } else {
-        logEvent(`Loan "${loan.productName}" paid off in full.`, 'good');
+        state.reputation = clamp(state.reputation + LOAN_PAID_OFF_REPUTATION_BONUS, 0, 100);
+        logEvent(`Loan "${loan.productName}" paid off in full — good standing with the bank boosts your reputation.`, 'good');
       }
       state.loans.splice(i, 1);
     }
@@ -848,6 +910,7 @@ function advanceDay() {
   driftMarketIndex();
 
   state.businesses.forEach(biz => tickBusiness(biz));
+  driftGlobalReputation();
 
   processLoansDaily();
 
@@ -1026,6 +1089,15 @@ function buyMarketing(bizId, tierId) {
   renderOperations();
 }
 
+function setAutoMarketing(bizId, tierId) {
+  const biz = state.businesses.find(b => b.id === bizId);
+  if (!biz) return;
+  biz.autoMarketingTierId = tierId || null;
+  const tier = biz.autoMarketingTierId ? MARKETING_TIERS.find(t => t.id === biz.autoMarketingTierId) : null;
+  logEvent(tier ? `Turned on auto-renew ("${tier.name}") at ${biz.name}.` : `Turned off auto-renew marketing at ${biz.name}.`, 'info');
+  renderOperations();
+}
+
 function upgradeProperty(bizId) {
   const biz = state.businesses.find(b => b.id === bizId);
   const cfg = BUSINESS_TYPES[biz.typeId];
@@ -1105,7 +1177,9 @@ function sellRealEstateProperty(bizId, propId) {
 // --- bank / loans ----------------------------------------------------
 
 function loanMax() {
-  return Math.max(5000, Math.round(state.cash * LOAN_MAX_MULTIPLE_OF_CASH));
+  // Reputation scales borrowing power: 0.5x at rep 0, 1x at rep 50 (default), 1.5x at rep 100.
+  const reputationMultiplier = 0.5 + (state.reputation / 100);
+  return Math.max(5000, Math.round(state.cash * LOAN_MAX_MULTIPLE_OF_CASH * reputationMultiplier));
 }
 
 // Standard amortized-loan payment formula:
@@ -1138,7 +1212,8 @@ function payOffLoan(loanId) {
   if (!loan) return;
   if (state.cash < loan.balance) { showToast(`Need ${formatMoney(loan.balance)} to pay this off`); return; }
   state.cash -= loan.balance;
-  logEvent(`Paid off the remaining ${formatMoney(loan.balance)} on your ${loan.productName} loan early.`, 'good');
+  state.reputation = clamp(state.reputation + LOAN_PAID_OFF_REPUTATION_BONUS, 0, 100);
+  logEvent(`Paid off the remaining ${formatMoney(loan.balance)} on your ${loan.productName} loan early — good standing with the bank boosts your reputation.`, 'good');
   state.loans = state.loans.filter(l => l.id !== loanId);
   renderAll();
 }
@@ -1341,11 +1416,23 @@ function marketingPanelHtml(biz, cfg) {
     <button class="btn btn-small" data-action="buy-marketing" data-biz="${biz.id}" data-tier="${t.id}">
       ${t.name} — ${formatMoney(t.cost)} (${t.durationDays}d)
     </button>`).join('');
+  const autoOptions = MARKETING_TIERS.map(t =>
+    `<option value="${t.id}" ${biz.autoMarketingTierId === t.id ? 'selected' : ''}>${t.name} — ${formatMoney(t.cost)} / ${t.durationDays}d</option>`
+  ).join('');
+  const autoTier = biz.autoMarketingTierId ? MARKETING_TIERS.find(t => t.id === biz.autoMarketingTierId) : null;
   return `
     <div class="card">
       <div class="panel-header"><h3>Marketing</h3>${cfg.adDependent ? '<span class="badge badge-loss">Ad-dependent</span>' : ''}</div>
       ${active ? `<p style="font-size:13px;margin-bottom:10px;">Running <strong>${MARKETING_TIERS.find(t => t.id === active.tierId).name}</strong> — ${active.daysLeft} day(s) left.</p>` : `<p class="muted" style="font-size:12.5px;margin-bottom:10px;">No campaign running${cfg.adDependent ? ' — demand is currently suppressed.' : '.'}</p>`}
       <div class="btn-row">${tiers}</div>
+      <div class="field" style="margin-top:14px;">
+        <label>Auto-renew (relaunches on its own the moment a campaign lapses — even while you're offline)</label>
+        <select data-action="set-auto-marketing" data-biz="${biz.id}">
+          <option value="">Off</option>
+          ${autoOptions}
+        </select>
+        <div class="hint">${autoTier ? `Every time "${autoTier.name}" runs out, it's automatically bought again for ${formatMoney(autoTier.cost)}, as long as there's cash on hand.` : 'Off — campaigns lapse and stay off until you buy one manually.'}</div>
+      </div>
     </div>`;
 }
 
@@ -1621,6 +1708,7 @@ function renderOperations() {
       <span style="font-size:26px;">${cfg.icon}</span>
       <input type="text" value="${escapeHtml(biz.name)}" data-action="rename-biz" data-biz="${biz.id}" style="font-family:var(--font-display); font-weight:600; font-size:15px; background:transparent; border:1px solid transparent; padding:6px 8px; max-width:260px;">
       <span class="badge ${biz.lastDaily.profit >= 0 ? 'badge-profit' : 'badge-loss'}" style="margin-left:auto;">Yesterday ${formatSignedMoney(biz.lastDaily.profit)}</span>
+      <span class="badge badge-neutral" title="Reputation drives this business's demand — profitable days raise it, losing days lower it.">Rep ${Math.round(biz.reputation)}</span>
       <button class="btn btn-small btn-ghost btn-danger-text" data-action="open-close-business-modal" data-biz="${biz.id}">Close business</button>
     </div>
     ${cfg.productCatalog ? productsPanelHtml(biz, cfg) : ''}
@@ -1703,7 +1791,8 @@ function renderFinances() {
         <thead><tr><th>Product</th><th>Balance</th><th>APR</th><th>Payment</th><th>Term</th><th>Status</th><th></th></tr></thead>
         <tbody>${loanRows}</tbody>
       </table>
-      ${state.loans.length > 0 ? `<p class="hint" style="padding:8px 10px;">Total outstanding: ${formatMoney(totalLoanBalance)}. Missed payments add a $${LOAN_MISSED_PENALTY} penalty and hurt your reputation.</p>` : ''}
+      ${state.loans.length > 0 ? `<p class="hint" style="padding:8px 10px;">Total outstanding: ${formatMoney(totalLoanBalance)}. Missed payments add a $${LOAN_MISSED_PENALTY} penalty and hurt your reputation; paying a loan off fully helps it.</p>` : ''}
+      <p class="hint" style="padding:8px 10px;">Reputation (${Math.round(state.reputation)}/100) scales how much you can borrow — it trails your businesses' own reputations, which rise on profitable days and fall on losing ones.</p>
     </div>
 
     <div class="panel-header" style="margin-top:22px;"><h3>Taxes</h3></div>
@@ -1804,7 +1893,7 @@ function openLoanModal() {
   openModal(`
     <button class="modal-close" data-action="close-modal">&times;</button>
     <h3>Take a loan</h3>
-    <p class="modal-sub">Max available right now: ${formatMoney(max)}, based on your cash on hand.</p>
+    <p class="modal-sub">Max available right now: ${formatMoney(max)}, based on your cash on hand and reputation (${Math.round(state.reputation)}/100).</p>
     <div class="field">
       <label>Loan product</label>
       <select id="loanProduct">${optionsHtml}</select>
@@ -1961,6 +2050,7 @@ function wireEvents() {
     switch (action) {
       case 'set-price': setPrice(bizId, +target.value); break;
       case 'set-product-price': setProductPrice(bizId, target.dataset.product, +target.value); break;
+      case 'set-auto-marketing': setAutoMarketing(bizId, target.value ? +target.value : null); break;
       case 'set-wage': setEmployeeWage(bizId, target.dataset.emp, +target.value); break;
       case 'rename-biz': renameBusiness(bizId, target.value); break;
       default: break;
